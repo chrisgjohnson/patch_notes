@@ -11,8 +11,8 @@ const slopesWorkletCode = `
 class SlopesProcessor extends AudioWorkletProcessor {
     constructor(options) {
         super();
-        this.currentVoltage = 0;
-        this.isRising = false; 
+        this.currentVoltage = 5;
+        this.isRising = true; 
         this.lastV = 0;
         
         // LED Accumulators
@@ -37,9 +37,9 @@ class SlopesProcessor extends AudioWorkletProcessor {
         const inputL = inputs[0][0] || new Float32Array(128).fill(0);
         const cvIn   = inputs[0][1] || new Float32Array(128).fill(0);
 
-        const RAIL_MAX = 0.98; 
-        const LOOP_OFFSET = 1.0; 
-        
+        const RAIL_MAX = 1.0; 
+        const LOOP_OFFSET = 0.99; 
+        const BLIP_OFFSET = 0.66;
         // LED Update Rate (~30Hz)
         const LED_UPDATE_RATE = 1600;
 
@@ -50,22 +50,18 @@ class SlopesProcessor extends AudioWorkletProcessor {
             
             let speedCtrl = this.params.knobRate + (cvIn[i] * 0.5);
             speedCtrl = Math.max(0.0, Math.min(1.0, speedCtrl));
-            
-            // CALIBRATION:
-            speedCtrl = Math.pow(speedCtrl, 2.8);
 
-            const MAX_COEFF = 0.038;       
-            const MIN_COEFF = 0.0000001;   
+            const MAX_COEFF = 0.12;       
+            //const MIN_COEFF = 0.0000001;   
             
-            const ratio = MIN_COEFF / MAX_COEFF;
-            let rate = MAX_COEFF * Math.pow(ratio, speedCtrl);
+            //const ratio = MIN_COEFF / MAX_COEFF;
+            let rate = MAX_COEFF * Math.exp(-4*speedCtrl*(2+speedCtrl));
+            const INSTANT = 0.118;
 
             // --- 2. SHAPE MODES (Switch Logic) ---
-            const INSTANT = 1.0;
             
             let riseCoeff = rate;
             let fallCoeff = rate;
-
             if (this.params.shape === 0) riseCoeff = INSTANT;
             if (this.params.shape === 2) fallCoeff = INSTANT;
 
@@ -73,27 +69,24 @@ class SlopesProcessor extends AudioWorkletProcessor {
             let target = inputVal;
             
             if (this.params.mode === 0) { // LOOP MODE
-                const ceiling = Math.min(RAIL_MAX, inputVal + LOOP_OFFSET);
-                const floor = inputVal;
-                
-                if (this.isRising) {
-                    target = ceiling + 0.05; 
-                    if (this.currentVoltage >= ceiling) this.isRising = false;
-                } else {
-                    target = floor - 0.05; 
-                    if (this.currentVoltage <= floor) this.isRising = true;
+                if (this.isRising) 
+                {
+                    target = inputVal + LOOP_OFFSET;
+                }
+                else
+                {
+                    target = inputVal;
                 }
             } 
             else if (this.params.mode === 2) { // GATE MODE
-                target = Math.min(RAIL_MAX, inputVal + LOOP_OFFSET);
+                target = inputVal + BLIP_OFFSET;
             }
 
             // --- 4. PHYSICS ---
             const delta = target - this.currentVoltage;
-            const isGrowing = delta > 0;
-            const activeCoeff = isGrowing ? riseCoeff : fallCoeff;
+            const activeCoeff = this.isRising ? riseCoeff : fallCoeff;
 
-            if (this.params.isExponential) {
+          /*  if (this.params.isExponential) {
                 if (isGrowing) {
                     // --- FIX: EXPONENTIAL ATTACK (Concave Up) ---
                     // "Start Slow, Get Faster"
@@ -109,19 +102,41 @@ class SlopesProcessor extends AudioWorkletProcessor {
                     // --- EXPONENTIAL DECAY (Convex Down) ---
                     // "Start Fast, Get Slower"
                     // Standard RC behavior.
-                    
-                    this.currentVoltage += delta * activeCoeff/1.3/2.5;
+                    let incr = delta + activeCoeff;
+
                 }
 
-            } else {
+            } else */{
                 // LINEAR MODE
-                const linearStep = activeCoeff * 0.1; 
-                
-                if (Math.abs(delta) <= linearStep) {
-                    this.currentVoltage = target;
-                } else {
-                    this.currentVoltage += Math.sign(delta) * linearStep;
-                }
+				const stepScale = 0.1;
+                const linearStep = activeCoeff * stepScale; 
+				const incr = linearStep * (this.isRising?1:-1);
+				this.currentVoltage = Math.min(this.currentVoltage + incr, RAIL_MAX);
+
+				if ((this.isRising && this.currentVoltage > target)
+                    || (!this.isRising && this.currentVoltage < target))
+				{
+					if (this.params.mode == 0)
+					{
+						// if in loop mode, voltage 'bounces' off threshold
+						const frac = (this.currentVoltage - target)/incr;
+						if (this.isRising)
+						{
+							this.currentVoltage = target;// - frac*fallCoeff*stepScale;
+							this.isRising = false;
+						}
+						else
+						{
+							this.currentVoltage = target;// + frac*riseCoeff*stepScale;
+							this.isRising = true;
+						}
+					}
+					else
+					{
+						// if not in loop mode, voltage clipped to threshold
+						this.currentVoltage = target;
+					}
+				}
             }
 
             output[i] = this.currentVoltage;
