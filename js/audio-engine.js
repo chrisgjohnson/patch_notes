@@ -197,7 +197,7 @@ class HumpbackFilterProcessor extends AudioWorkletProcessor {
     static get parameterDescriptors() {
         return [
             { name: 'cutoff', defaultValue: 1000, minValue: 10, maxValue: 22000 },
-            { name: 'resonance', defaultValue: 0, minValue: 0, maxValue: 2.0 }, // Keep max 2.0 for range
+            { name: 'resonance', defaultValue: 0, minValue: 0, maxValue: 2.0 }, 
             { name: 'mode', defaultValue: 0 } 
         ];
     }
@@ -223,7 +223,8 @@ class HumpbackFilterProcessor extends AudioWorkletProcessor {
             // 1. INPUT + NOISE INJECTION
             // We add tiny noise (-60dB to -80dB range) to kickstart self-oscillation
             let inSample = input ? input[i] : 0;
-            inSample += (Math.random() - 0.5) * 0.0003; 
+            // Tiny noise floor to allow pinging from silence
+            inSample += (Math.random() - 0.5) * 0.002; 
 
             const cutoff = cutParams.length > 1 ? cutParams[i] : cutParams[0];
             const res = resParams.length > 1 ? resParams[i] : resParams[0];
@@ -233,32 +234,34 @@ class HumpbackFilterProcessor extends AudioWorkletProcessor {
             if (f > 0.9) f = 0.9; 
 
             // Resonance/Damping
-            let q = 1.0 - res; 
-
-            // 2. STANDARD SVF CORE (Reverted to clean integration)
+            let q = 2.0 - (res * 2.0);
             
             const low = this.ic2eq;
             const band = this.ic1eq;
             
-            // Saturation on feedback only (Original behavior)
+            // "Humpback" Character: Tanh on the feedback loop naturally stabilizes amplitude
             const feedback = Math.tanh(band); 
             
             const high = inSample - (feedback * q) - low;
             
-            // Standard linear integration
             const bandNew = band + (f * high);
             const lowNew = low + (f * bandNew);
             
-            // Update State
+            // Update State (No hard clamping here anymore)
             this.ic1eq = bandNew;
             this.ic2eq = lowNew;
 
-            if (outLP) outLP[i] = lowNew;
+            if (outLP) {
+                outLP[i] = Math.tanh(lowNew);
+            }
 
             if (outSwitched) {
-                if (mode < 0.5) outSwitched[i] = high; 
-                else if (mode < 1.5) outSwitched[i] = bandNew; 
-                else outSwitched[i] = high + lowNew; 
+                let val = 0;
+                if (mode < 0.5) val = high; 
+                else if (mode < 1.5) val = bandNew; 
+                else val = high + lowNew; 
+                
+                outSwitched[i] = Math.tanh(val);
             }
         }
         return true;
@@ -266,7 +269,6 @@ class HumpbackFilterProcessor extends AudioWorkletProcessor {
 }
 registerProcessor('humpback-processor', HumpbackFilterProcessor);
 `;
-
 
 // --- RECORDER WORKLET ---
 const recorderWorkletCode = `
@@ -1705,7 +1707,7 @@ function updateAudioParams() {
 
         // 3. Resonance
         const rRaw = getKnobValue(kRes, 0, 1, 'linear');
-        const resVal = Math.pow(rRaw, 1.5) * 1.3; 
+        const resVal = Math.pow(rRaw, 1.4) * 1.3; 
         safeParam(node.parameters.get('resonance'), resVal, now);
 
         // 4. Update Mode Switch
