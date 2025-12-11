@@ -525,7 +525,7 @@ textarea#globalNotesArea {
     position: absolute;
     width: 1.4%; padding-bottom: 1.2%; height: 0;
     border-radius: 50%;
-    background-color: var(--switch-bg);
+    background-color: rgba(127,127,127,0.5);
     border: 1px solid rgba(0,0,0,0.6);
     transform: translate(-50%, -50%);
     pointer-events: none;
