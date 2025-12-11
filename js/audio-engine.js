@@ -6,6 +6,94 @@
 /* =========================================================================
    AUDIO WORKLETS
    ========================================================================= */
+
+
+// --- VCO WORKLET ---
+const vcoWorkletCode = `
+class VCOProcessor extends AudioWorkletProcessor {
+    static get parameterDescriptors() {
+        return [
+            { name: 'frequency', defaultValue: 440, minValue: 0 },
+            { name: 'detune', defaultValue: 0 },
+            { name: 'fmGain', defaultValue: 0 }, // AC Mod Depth
+            { name: 'feedbackAmt', defaultValue: 0 } // Switch
+        ];
+    }
+
+    constructor() {
+        super();
+        this.phase = 0;
+    }
+
+    poly_blep(t, dt) {
+        if (t < dt) {
+            let x = t / dt;
+            return 2 * x - x * x - 1;
+        } else if (t > 1 - dt) {
+            let x = (t - 1) / dt;
+            return x * x + 2 * x + 1;
+        }
+        return 0;
+    }
+
+    process(inputs, outputs, parameters) {
+        const outSqr = outputs[0][0];
+        const outSin = outputs[1][0];
+        
+        const freqParams = parameters.frequency;
+        const detuneParams = parameters.detune;
+        const fbParams = parameters.feedbackAmt;
+        const fmGainParams = parameters.fmGain;
+
+        const sampleRate = 48000;
+        const nyquist = sampleRate / 2;
+
+        for (let i = 0; i < outSqr.length; i++) {
+            const baseFreq = freqParams.length > 1 ? freqParams[i] : freqParams[0];
+            const detune = detuneParams.length > 1 ? detuneParams[i] : detuneParams[0];
+            const fbNorm = fbParams.length > 1 ? fbParams[i] : fbParams[0];
+            const fmKnob = fmGainParams.length > 1 ? fmGainParams[i] : fmGainParams[0];
+
+            let totalDetune = detune;
+            
+            // Apply Feedback
+            if (fbNorm > 0.01) {
+                const currentSin = Math.sin(this.phase * 2 * Math.PI);
+                
+                // Scaled Feedback (0.3 factor)
+                totalDetune += (currentSin * fmKnob * 0.3);
+            }
+
+            // Calculate Frequency
+            let freq = baseFreq * Math.pow(2, totalDetune / 1200);
+            
+            // --- STABILITY FIX: Clamp Frequency ---
+            // Prevents dt > 0.5 which breaks PolyBLEP and causes instability
+            if (freq > nyquist) freq = nyquist;
+            if (freq < 0) freq = 0;
+
+            const dt = freq / sampleRate;
+            this.phase += dt;
+            if (this.phase >= 1.0) this.phase -= 1.0;
+
+            const sineSamp = Math.sin(this.phase * 2 * Math.PI);
+            if(outSin) outSin[i] = sineSamp * 0.458; 
+
+            // Square with PolyBLEP
+            let sqrSamp = this.phase < 0.5 ? 1.0 : -1.0;
+            sqrSamp += this.poly_blep(this.phase, dt);
+            sqrSamp -= this.poly_blep((this.phase + 0.5) % 1.0, dt);
+            
+            if(outSqr) outSqr[i] = sqrSamp * 0.375; 
+        }
+
+        return true;
+    }
+}
+registerProcessor('vco-processor', VCOProcessor);
+`;
+
+
 // --- SLOPES WORKLET ---
 const slopesWorkletCode = `
 class SlopesProcessor extends AudioWorkletProcessor {
@@ -161,6 +249,9 @@ class RecorderProcessor extends AudioWorkletProcessor {
 }
 registerProcessor('recorder-processor', RecorderProcessor);
 `;
+
+
+
 
 const TWISTS_WORKLET_CODE = `
 class TwistsProcessor extends AudioWorkletProcessor {
@@ -630,34 +721,45 @@ function createComputerIO(ctx) {
     };
 }
 
-function createVCO(type = 'sawtooth') {
-    const osc = audioCtx.createOscillator();
-    osc.type = type;
-    osc.start();
-    
-    // --- FIX: Output Buffer & Level Scaling ---
-    const output = audioCtx.createGain();
-    
-    // Scale amplitudes (Reference: +/- 12V system)
-    if (type === 'sine') {
-        output.gain.value = 5.5 / 12.0; // +/- 5.5V
-    } else if (type === 'square') {
-        output.gain.value = 4.5 / 12.0; // +/- 4.5V
-    } else {
-        output.gain.value = 5.0 / 12.0; // Default
-    }
+function createVCO(id) { // Added ID param to identify self-patching later
+    const node = new AudioWorkletNode(audioCtx, 'vco-processor', {
+        numberOfInputs: 1,
+        numberOfOutputs: 2, // 0: Square, 1: Sine
+        outputChannelCount: [1, 1]
+    });
 
-    osc.connect(output);
-    
+    // Output Buffers (for signal distribution)
+    const sqrBuff = audioCtx.createGain(); sqrBuff.gain.value = 1.0;
+    const sinBuff = audioCtx.createGain(); sinBuff.gain.value = 1.0;
+
+    // Split Worklet Outputs
+    node.connect(sqrBuff, 0);
+    node.connect(sinBuff, 1);
+
+    // FM Input Helper
+    // The Worklet Input 0 is for "Linear Through-Zero" or direct signal FM.
+    // But our system uses Exponential FM mapped to Detune.
+    // So we connect the FM Gain to the DETUNE PARAMETER, not the audio input.
     const fmGain = audioCtx.createGain();
-    // Connect to detune for Exponential FM (exp(0.71*V))
-    fmGain.connect(osc.detune); 
+    fmGain.connect(node.parameters.get('detune'));
 
+    // Pitch Sum (Coarse + Fine + V/Oct)
     const pitchSum = audioCtx.createGain();
-    pitchSum.gain.value = 6000;
-    pitchSum.connect(osc.detune);
+    pitchSum.gain.value = 1.0; 
+    // Note: V/Oct inputs (like Volt1) are -1..1.
+    // 1.0 unit = 5 Octaves = 6000 cents.
+    const vOctScaler = audioCtx.createGain();
+    vOctScaler.gain.value = 6000; 
+    pitchSum.connect(vOctScaler);
+    vOctScaler.connect(node.parameters.get('detune'));
 
-    return { osc, output, fmGain, pitchSum };
+    return { 
+        osc: node, // Keeps compatibility with generic update logic
+        output: sqrBuff, // Default Square out
+        sinOutput: sinBuff, // Sine out
+        fmGain, 
+        pitchSum 
+    };
 }
 
 function createVCF() {
@@ -872,10 +974,15 @@ function buildAudioGraph() {
         const blobTwists = new Blob([TWISTS_WORKLET_CODE], { type: 'application/javascript' });
         const urlTwists = URL.createObjectURL(blobTwists);
 
+        // 4. VCO Worklet (NEW)
+        const blobVco = new Blob([vcoWorkletCode], { type: 'application/javascript' });
+        const urlVco = URL.createObjectURL(blobVco);
+
         Promise.all([
             audioCtx.audioWorklet.addModule(urlSlopes),
             audioCtx.audioWorklet.addModule(urlRec),
-            audioCtx.audioWorklet.addModule(urlTwists)
+            audioCtx.audioWorklet.addModule(urlTwists),
+            audioCtx.audioWorklet.addModule(urlVco)
         ]).then(() => {
             audioNodes['workletLoaded'] = true;
             finishBuild();
@@ -939,10 +1046,10 @@ function finishBuild() {
         swapComputerCard(targetCardId);
 
         // --- Standard Synth Modules ---
-        audioNodes['VCO1'] = createVCO('square');
-        audioNodes['VCO1_Sin'] = createVCO('sine');
-        audioNodes['VCO2'] = createVCO('square');
-        audioNodes['VCO2_Sin'] = createVCO('sine');
+        audioNodes['VCO1'] = createVCO('VCO1');
+        audioNodes['VCO1_Sin'] = { output: audioNodes['VCO1'].sinOutput, fmGain: audioNodes['VCO1'].fmGain, pitchSum: audioNodes['VCO1'].pitchSum };
+        audioNodes['VCO2'] = createVCO('VCO2');
+        audioNodes['VCO2_Sin'] = { output: audioNodes['VCO2'].sinOutput, fmGain: audioNodes['VCO2'].fmGain, pitchSum: audioNodes['VCO2'].pitchSum };
 
         audioNodes['VCF1'] = createVCF(); audioNodes['VCF2'] = createVCF();
         audioNodes['Slopes1'] = createSlopes(false); audioNodes['Slopes2'] = createSlopes(true);
@@ -1056,12 +1163,16 @@ function finishBuild() {
         'jack-pulse1in': audioNodes['Computer_IO'].pulse1In,
         'jack-pulse2in': audioNodes['Computer_IO'].pulse2In,
 
-        'jack-osc1sqrOut': audioNodes['VCO1'].output, 
-        'jack-osc1sinOut': audioNodes['VCO1_Sin'].output,
-        'jack-osc1pitchIn': [audioNodes['VCO1'].pitchSum, audioNodes['VCO1_Sin'].pitchSum], 
-        'jack-osc1fmIn': [audioNodes['VCO1'].fmGain, audioNodes['VCO1_Sin'].fmGain],
-        'jack-osc2sqrOut': audioNodes['VCO2'].output, 
-        'jack-osc2sinOut': audioNodes['VCO2_Sin'].output,
+        'jack-osc1sqrOut': audioNodes['VCO1'].output,
+        'jack-osc1sinOut': audioNodes['VCO1'].sinOutput, // Use the new Sine buffer
+        // Pitch/FM inputs are shared since it's one module now
+        'jack-osc1pitchIn': audioNodes['VCO1'].pitchSum, 
+        'jack-osc1fmIn': audioNodes['VCO1'].fmGain,
+
+        'jack-osc2sqrOut': audioNodes['VCO2'].output,
+        'jack-osc2sinOut': audioNodes['VCO2'].sinOutput,
+        'jack-osc2pitchIn': audioNodes['VCO2'].pitchSum,
+        'jack-osc2fmIn': audioNodes['VCO2'].fmGain,
         
         'jack-osc2pitchIn': [audioNodes['VCO2'].pitchSum, audioNodes['VCO2_Sin'].pitchSum], 
         'jack-osc2fmIn': [audioNodes['VCO2'].fmGain, audioNodes['VCO2_Sin'].fmGain],
@@ -1420,33 +1531,61 @@ function updateAudioParams() {
     };
 
     // --- OSC 1 ---
+    const vco1 = audioNodes['VCO1'];
     const osc1Freq = getOscFreq('knob-large-osc1');
     const fine1 = getFineTune('knob-small-osc1fine');
-
-    safeParam(audioNodes['VCO1'].osc.frequency, osc1Freq, now);
-    safeParam(audioNodes['VCO1'].osc.detune, fine1, now);
-    safeParam(audioNodes['VCO1_Sin'].osc.frequency, osc1Freq, now);
-    safeParam(audioNodes['VCO1_Sin'].osc.detune, fine1, now);
     
-    // FM: Max 14750 cents (approx 12.3 octaves at 12V input)
-    // Using exponential knob curve for smoother control at low levels
-    const fm1 = getKnobValue('knob-small-osc1fm', 0, 14750, 'exp');
-    safeParam(audioNodes['VCO1'].fmGain.gain, fm1, now); 
-    safeParam(audioNodes['VCO1_Sin'].fmGain.gain, fm1, now);
+    safeParam(vco1.osc.parameters.get('frequency'), osc1Freq, now);
+    safeParam(vco1.osc.parameters.get('detune'), fine1, now);
+
+    // FM AC Depth (Exponential curve for timbre)
+    const fm1Val = getKnobValue('knob-small-osc1fm', 0, 14750, 'exp');
+    safeParam(vco1.fmGain.gain, fm1Val, now);
+
+    // Self-Patch Logic
+    const isSelfPatched1 = cableData.some(c => 
+        (c.start === 'jack-osc1sinOut' && c.end === 'jack-osc1fmIn') ||
+        (c.start === 'jack-osc1fmIn' && c.end === 'jack-osc1sinOut')
+    );
+    
+    if (isSelfPatched1) {
+        // Calculate Normalized Knob Position (0.0 to 1.0)
+        // Knob raw: -150 to +150.
+        const kRaw = componentStates['knob-small-osc1fm'] ? parseFloat(componentStates['knob-small-osc1fm'].value) : -150;
+        const kNorm = (kRaw + 150) / 300;
+        
+        safeParam(vco1.osc.parameters.get('feedbackAmt'), kNorm, now);
+        safeParam(vco1.osc.parameters.get('fmGain'), fm1Val, now);
+    } else {
+        safeParam(vco1.osc.parameters.get('feedbackAmt'), 0, now);
+    }
 
     // --- OSC 2 ---
+    const vco2 = audioNodes['VCO2'];
     const osc2Freq = getOscFreq('knob-large-osc2');
     const fine2 = getFineTune('knob-small-osc2fine');
+    
+    safeParam(vco2.osc.parameters.get('frequency'), osc2Freq, now);
+    safeParam(vco2.osc.parameters.get('detune'), fine2, now);
 
-    safeParam(audioNodes['VCO2'].osc.frequency, osc2Freq, now);
-    safeParam(audioNodes['VCO2'].osc.detune, fine2, now);
-    safeParam(audioNodes['VCO2_Sin'].osc.frequency, osc2Freq, now);
-    safeParam(audioNodes['VCO2_Sin'].osc.detune, fine2, now);
+    const fm2Val = getKnobValue('knob-small-osc2fm', 0, 14750, 'exp');
+    safeParam(vco2.fmGain.gain, fm2Val, now);
+
+    const isSelfPatched2 = cableData.some(c => 
+        (c.start === 'jack-osc2sinOut' && c.end === 'jack-osc2fmIn') ||
+        (c.start === 'jack-osc2fmIn' && c.end === 'jack-osc2sinOut')
+    );
     
-    const fm2 = getKnobValue('knob-small-osc2fm', 0, 14750, 'exp');
-    safeParam(audioNodes['VCO2'].fmGain.gain, fm2, now); 
-    safeParam(audioNodes['VCO2_Sin'].fmGain.gain, fm2, now);
-    
+    if (isSelfPatched2) {
+        const kRaw = componentStates['knob-small-osc2fm'] ? parseFloat(componentStates['knob-small-osc2fm'].value) : -150;
+        const kNorm = (kRaw + 150) / 300;
+        
+        safeParam(vco2.osc.parameters.get('feedbackAmt'), kNorm, now);
+        safeParam(vco2.osc.parameters.get('fmGain'), fm2Val, now);
+    } else {
+        safeParam(vco2.osc.parameters.get('feedbackAmt'), 0, now);
+    }
+
     // Filters
     const getRes = (kId) => {
         const raw = getKnobValue(kId, 0, 1, 'linear');
