@@ -75,10 +75,10 @@ function updateScopeConnection() {
         'jack-pulse2out': audioNodes['Computer_IO']?.pulse2Out,
         
         // Oscillators
-        'jack-osc1sqrOut': audioNodes['VCO1']?.osc,
-        'jack-osc1sinOut': audioNodes['VCO1_Sin']?.osc,
-        'jack-osc2sqrOut': audioNodes['VCO2']?.osc,
-        'jack-osc2sinOut': audioNodes['VCO2_Sin']?.osc,
+        'jack-osc1sqrOut': audioNodes['VCO1'].output,
+        'jack-osc1sinOut': audioNodes['VCO1_Sin'].output,
+        'jack-osc2sqrOut': audioNodes['VCO2'].output,
+        'jack-osc2sinOut': audioNodes['VCO2_Sin'].output,
         
         // Processors
         'jack-slopes1out': audioNodes['Slopes1']?.output,
@@ -196,22 +196,80 @@ function drawScope() {
     ctx.fillRect(0, 0, width, height);
 
     ctx.lineWidth = 1;
+    
+    // X-Axis Grid (Time) - 8 Divisions
     ctx.strokeStyle = '#333';
     ctx.beginPath();
-
-    const xDivs = 8;
-    const yDivs = 4;
-    for (let i = 1; i < xDivs; i++) {
-        const x = (width / xDivs) * i;
+    for (let i = 1; i < 8; i++) {
+        const x = (width / 8) * i;
         ctx.moveTo(x, 0);
         ctx.lineTo(x, height);
     }
-    for (let i = 1; i < yDivs; i++) {
-        const y = (height / yDivs) * i;
+    ctx.stroke();
+
+    // Y-Axis Grid (Voltage) - +/- 12V scale (3V steps)
+    const voltageSteps = [12, 9, 6, 3, 0, -3, -6, -9, -12];
+    
+    ctx.beginPath();
+    voltageSteps.forEach(v => {
+        const unit = v / 12.0; 
+        const y = (height / 2) - (unit * (height * 0.45));
+        
+        // 0V is brighter, others are dim
+        ctx.strokeStyle = (v === 0) ? '#555' : '#2a2a2a'; 
+        
         ctx.moveTo(0, y);
         ctx.lineTo(width, y);
-    }
+    });
     ctx.stroke();
+
+    // --- LABELS (Voltage & Time) ---
+    if (!scopeSpecMode && !scopeXYMode) {
+        ctx.fillStyle = '#666';
+        ctx.font = '9px monospace';
+        
+        // 1. Voltage Labels (Left)
+        ctx.textAlign = 'left';
+        ctx.textBaseline = 'middle';
+        const labelVoltages = [12, 6, 0, -6, -12];
+        labelVoltages.forEach(v => {
+            const unit = v / 12.0;
+            const y = (height / 2) - (unit * (height * 0.45));
+            const text = (v > 0 ? "+" : "") + v + "V";
+            ctx.fillText(text, 4, y);
+        });
+
+        // 2. Time/Div Label (Bottom Right)
+        // We replicate the zoom logic here to calculate the exact time scale
+        const slider = document.getElementById('scopeTime');
+        const sliderVal = slider ? parseInt(slider.value) : 50;
+        let samplesOnScreen = 0;
+
+        if (sliderVal > 80) {
+             // Rolling Mode Logic
+             samplesOnScreen = 256 + ((sliderVal - 80) * 100);
+        } else {
+             // Triggered Snapshot Logic
+             const minSamples = 32; 
+             const maxSamples = 8192;
+             const logScale = Math.pow(maxSamples / minSamples, sliderVal / 80);
+             samplesOnScreen = Math.floor(minSamples * logScale);
+        }
+
+        if (audioCtx) {
+            const totalMs = (samplesOnScreen / audioCtx.sampleRate) * 1000;
+            const msPerDiv = totalMs / 8; // 8 Horizontal Divisions
+            
+            let timeText = "";
+            if (msPerDiv >= 1000) timeText = (msPerDiv/1000).toFixed(2) + "s";
+            else if (msPerDiv >= 1) timeText = msPerDiv.toFixed(1) + "ms";
+            else timeText = (msPerDiv * 1000).toFixed(0) + "us";
+
+            ctx.textAlign = "right";
+            ctx.textBaseline = "bottom";
+            ctx.fillText(timeText + "/div", width - 4, height - 2);
+        }
+    }
 
     // --- 3. TRIGGER LEVEL UI ---
     const trigInput = document.getElementById('scopeTrigger');
@@ -314,7 +372,12 @@ function drawScope() {
                 if (v < min) min = v;
                 if (v > max) max = v;
             }
-            const vpp = max - min;
+            
+            // Raw Vpp (0.0 to 2.0)
+            const rawVpp = max - min;
+            
+            // Scale to System Voltage (1.0 = 12V)
+            const vpp = rawVpp * 12.0;
 
             const elVpp = document.getElementById('measVpp');
             if (elVpp) elVpp.textContent = `Vpp:${vpp.toFixed(2)}V`;
