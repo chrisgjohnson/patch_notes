@@ -1291,11 +1291,24 @@ function finishBuild() {
     connectPedalChain();
 
     cableData.forEach(cable => {
+        // These connections are handled internally by the Worklet (via 'feedbackAmt')
+        // to achieve zero-latency feedback. Connecting them here would double the signal.
+        const isVco1Self = (cable.start === 'jack-osc1sinOut' && cable.end === 'jack-osc1fmIn') ||
+                           (cable.start === 'jack-osc1fmIn' && cable.end === 'jack-osc1sinOut');
+
+        const isVco2Self = (cable.start === 'jack-osc2sinOut' && cable.end === 'jack-osc2fmIn') ||
+                           (cable.start === 'jack-osc2fmIn' && cable.end === 'jack-osc2sinOut');
+
+        if (isVco1Self || isVco2Self) return; 
+        // --- FIX END ---
+
         const sMap = jackMap[cable.start]; const eMap = jackMap[cable.end];
         const isOutput = (id) => /out|volt|send/i.test(id); const isInput = (id) => /in|fm|return/i.test(id);
+        
         let source = null, dest = null;
         if (isOutput(cable.start) && isInput(cable.end)) { source = sMap; dest = eMap; }
         else if (isOutput(cable.end) && isInput(cable.start)) { source = eMap; dest = sMap; }
+        
         if (source && dest) {
             const sources = Array.isArray(source) ? source : [source]; const dests = Array.isArray(dest) ? dest : [dest];
             sources.forEach(src => { dests.forEach(dst => { try { if (dst instanceof AudioParam) src.connect(dst); else src.connect(dst); } catch (e) { } }); });
