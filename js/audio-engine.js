@@ -191,6 +191,83 @@ class SlopesProcessor extends AudioWorkletProcessor {
 registerProcessor('slopes-processor', SlopesProcessor);
 `;
 
+// --- HUMPBACK FILTER WORKLET (OTA SVF Model) ---
+const humpbackWorkletCode = `
+class HumpbackFilterProcessor extends AudioWorkletProcessor {
+    static get parameterDescriptors() {
+        return [
+            { name: 'cutoff', defaultValue: 1000, minValue: 10, maxValue: 22000 },
+            { name: 'resonance', defaultValue: 0, minValue: 0, maxValue: 2.0 }, // Keep max 2.0 for range
+            { name: 'mode', defaultValue: 0 } 
+        ];
+    }
+
+    constructor() {
+        super();
+        this.ic1eq = 0;
+        this.ic2eq = 0;
+    }
+
+    process(inputs, outputs, parameters) {
+        const input = inputs[0][0]; 
+        const outLP = outputs[0][0]; 
+        const outSwitched = outputs[1][0]; 
+
+        const cutParams = parameters.cutoff;
+        const resParams = parameters.resonance;
+        const modeParams = parameters.mode;
+        
+        const sampleRate = 48000;
+
+        for (let i = 0; i < (outLP ? outLP.length : 128); i++) {
+            // 1. INPUT + NOISE INJECTION
+            // We add tiny noise (-60dB to -80dB range) to kickstart self-oscillation
+            let inSample = input ? input[i] : 0;
+            inSample += (Math.random() - 0.5) * 0.0003; 
+
+            const cutoff = cutParams.length > 1 ? cutParams[i] : cutParams[0];
+            const res = resParams.length > 1 ? resParams[i] : resParams[0];
+            const mode = modeParams.length > 1 ? modeParams[i] : modeParams[0];
+
+            let f = 2 * Math.sin(Math.PI * (cutoff / sampleRate));
+            if (f > 0.9) f = 0.9; 
+
+            // Resonance/Damping
+            let q = 1.0 - res; 
+
+            // 2. STANDARD SVF CORE (Reverted to clean integration)
+            
+            const low = this.ic2eq;
+            const band = this.ic1eq;
+            
+            // Saturation on feedback only (Original behavior)
+            const feedback = Math.tanh(band); 
+            
+            const high = inSample - (feedback * q) - low;
+            
+            // Standard linear integration
+            const bandNew = band + (f * high);
+            const lowNew = low + (f * bandNew);
+            
+            // Update State
+            this.ic1eq = bandNew;
+            this.ic2eq = lowNew;
+
+            if (outLP) outLP[i] = lowNew;
+
+            if (outSwitched) {
+                if (mode < 0.5) outSwitched[i] = high; 
+                else if (mode < 1.5) outSwitched[i] = bandNew; 
+                else outSwitched[i] = high + lowNew; 
+            }
+        }
+        return true;
+    }
+}
+registerProcessor('humpback-processor', HumpbackFilterProcessor);
+`;
+
+
 // --- RECORDER WORKLET ---
 const recorderWorkletCode = `
 class RecorderProcessor extends AudioWorkletProcessor {
@@ -763,33 +840,33 @@ function createVCO(id) { // Added ID param to identify self-patching later
 }
 
 function createVCF() {
+    const node = new AudioWorkletNode(audioCtx, 'humpback-processor', {
+        numberOfInputs: 1,
+        numberOfOutputs: 2, // 0: LP, 1: Switched (HP/BP/Notch)
+        outputChannelCount: [1, 1]
+    });
+
     const input = audioCtx.createGain();
-
-    // 3 Parallel Topologies for "Multimode" behavior
-    const filter = audioCtx.createBiquadFilter(); // Low Pass (Fixed Output)
-    filter.type = 'lowpass';
-
-    const hpFilter = audioCtx.createBiquadFilter(); // High Pass (Switchable)
-    hpFilter.type = 'highpass';
-
-    const bpFilter = audioCtx.createBiquadFilter(); // Band Pass (Switchable)
-    bpFilter.type = 'bandpass';
-
-    // Connect Input to All Filters
-    input.connect(filter);
-    input.connect(hpFilter);
-    input.connect(bpFilter);
+    input.connect(node);
 
     // Outputs
-    const hpBpOut = audioCtx.createGain(); // The Switchable Output
+    const lpOut = audioCtx.createGain();
+    const hpBpOut = audioCtx.createGain();
+    
+    node.connect(lpOut, 0);   // Fixed LP output
+    node.connect(hpBpOut, 1); // Switchable output
 
     // FM Logic
     const fmGain = audioCtx.createGain();
-    fmGain.connect(filter.frequency);
-    fmGain.connect(hpFilter.frequency);
-    fmGain.connect(bpFilter.frequency);
+    fmGain.connect(node.parameters.get('cutoff'));
 
-    return { input, filter, hpFilter, bpFilter, hpBpOut, fmGain };
+    return { 
+        input, 
+        processor: node,
+        filter: lpOut,
+        hpBpOut,
+        fmGain 
+    };
 }
 
 function createSlopes(isExponential = false) {
@@ -978,11 +1055,16 @@ function buildAudioGraph() {
         const blobVco = new Blob([vcoWorkletCode], { type: 'application/javascript' });
         const urlVco = URL.createObjectURL(blobVco);
 
+        // 5. Humpback Filter Worklet
+        const blobHump = new Blob([humpbackWorkletCode], { type: 'application/javascript' });
+        const urlHump = URL.createObjectURL(blobHump);
+
         Promise.all([
             audioCtx.audioWorklet.addModule(urlSlopes),
             audioCtx.audioWorklet.addModule(urlRec),
             audioCtx.audioWorklet.addModule(urlTwists),
-            audioCtx.audioWorklet.addModule(urlVco)
+            audioCtx.audioWorklet.addModule(urlVco),
+            audioCtx.audioWorklet.addModule(urlHump)
         ]).then(() => {
             audioNodes['workletLoaded'] = true;
             finishBuild();
@@ -1131,8 +1213,15 @@ function finishBuild() {
         disconnectNode(audioNodes['VCO2'].output); 
         disconnectNode(audioNodes['VCO2_Sin'].output);
     }
-    if (audioNodes['VCF1']) { disconnectNode(audioNodes['VCF1'].filter); disconnectNode(audioNodes['VCF1'].hpBpOut); }
-    if (audioNodes['VCF2']) { disconnectNode(audioNodes['VCF2'].filter); disconnectNode(audioNodes['VCF2'].hpBpOut); }
+    // Update Filter Disconnects
+    if (audioNodes['VCF1']) { 
+        disconnectNode(audioNodes['VCF1'].filter); 
+        disconnectNode(audioNodes['VCF1'].hpBpOut); 
+    }
+    if (audioNodes['VCF2']) { 
+        disconnectNode(audioNodes['VCF2'].filter); 
+        disconnectNode(audioNodes['VCF2'].hpBpOut); 
+    }
     if (audioNodes['Slopes1']) disconnectNode(audioNodes['Slopes1'].output);
     if (audioNodes['Slopes2']) disconnectNode(audioNodes['Slopes2'].output);
     if (audioNodes['RingMod']) disconnectNode(audioNodes['RingMod'].output);
@@ -1586,45 +1675,46 @@ function updateAudioParams() {
         safeParam(vco2.osc.parameters.get('feedbackAmt'), 0, now);
     }
 
-    // Filters
-    const getRes = (kId) => {
-        const raw = getKnobValue(kId, 0, 1, 'linear');
-        return 0.5 + (Math.pow(raw, 2) * 40) * 2;
-    };
+    const updateFilter = (mod, kCutoff, kRes, kFm, swId) => {
+        const node = mod.processor;
+        if(!node) return;
 
-    const updateFilter = (mod, f, res, fm, swId) => {
-        safeParam(mod.filter.frequency, f, now);
-        safeParam(mod.hpFilter.frequency, f, now);
-        safeParam(mod.bpFilter.frequency, f, now);
-        safeParam(mod.filter.Q, res, now);
-        safeParam(mod.hpFilter.Q, res, now);
-        safeParam(mod.bpFilter.Q, res, now);
-        safeParam(mod.fmGain.gain, fm, now);
+        // 1. Calculate Cutoff (Exponential)
+        const cutVal = componentStates[kCutoff] ? parseFloat(componentStates[kCutoff].value) : -150;
+        // Map -150..150 to 20Hz..20kHz
+        const cutoffHz = 20 * Math.pow(1000, (cutVal + 150) / 300);
+        
+        safeParam(node.parameters.get('cutoff'), cutoffHz, now);
 
+        // 2. FM Amount (Linear FM)
+        const fmDepth = getKnobValue(kFm, 0, 10000, 'exp'); 
+        safeParam(mod.fmGain.gain, fmDepth, now);
+
+        // 3. Resonance
+        // Worklet expects 0.0 to 1.1 (1.0 = Self Osc)
+        const rRaw = getKnobValue(kRes, 0, 1, 'linear');
+        const resVal = Math.pow(rRaw, 1.5) * 1.3; 
+        safeParam(node.parameters.get('resonance'), resVal, now);
+
+        // 4. Update Mode Switch
         const sw = componentStates[swId]?.value || 0;
-        try { mod.hpFilter.disconnect(mod.hpBpOut); } catch (e) { }
-        try { mod.bpFilter.disconnect(mod.hpBpOut); } catch (e) { }
-
-        if (sw === 1) {
-            mod.hpFilter.connect(mod.hpBpOut);
-        } else {
-            mod.bpFilter.connect(mod.hpBpOut);
-        }
+        safeParam(node.parameters.get('mode'), sw, now);
     };
 
+    // --- Correct Calls (Pass IDs, not values) ---
     updateFilter(
         audioNodes['VCF1'],
-        getKnobValue('knob-large-filter1', 20, 12000, 'exp'),
-        getRes('knob-small-filter1res'),
-        getKnobValue('knob-small-filter1fm', 0, 4000, 'exp'),
+        'knob-large-filter1',
+        'knob-small-filter1res',
+        'knob-small-filter1fm',
         'switch-2way-filter1hp'
     );
 
     updateFilter(
         audioNodes['VCF2'],
-        getKnobValue('knob-large-filter2', 20, 12000, 'exp'),
-        getRes('knob-small-filter2res'),
-        getKnobValue('knob-small-filter2fm', 0, 4000, 'exp'),
+        'knob-large-filter2',
+        'knob-small-filter2res',
+        'knob-small-filter2fm',
         'switch-2way-filter2hp'
     );
 
