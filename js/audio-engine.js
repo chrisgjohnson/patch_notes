@@ -12,8 +12,7 @@ class SlopesProcessor extends AudioWorkletProcessor {
     constructor(options) {
         super();
         this.currentVoltage = 0;
-        this.isRising = false; 
-        this.lastV = 0;
+        this.loopOffset = true; // loop flip-flop state 
         
         // LED Accumulators
         this.riseSamples = 0;
@@ -37,115 +36,63 @@ class SlopesProcessor extends AudioWorkletProcessor {
         const inputL = inputs[0][0] || new Float32Array(128).fill(0);
         const cvIn   = inputs[0][1] || new Float32Array(128).fill(0);
 
-        const RAIL_MAX = 0.98; 
-        const LOOP_OFFSET = 1.0; 
-        
+        const RAIL_MAX = 1.0; 
+        const LOOP_OFFSET = 0.99; 
+        const BLIP_OFFSET = 0.66;
+        const EXP_AMT = 0.17;
+        const MAX_COEFF = 0.012;       
+        const INSTANT = 0.0118;
         // LED Update Rate (~30Hz)
         const LED_UPDATE_RATE = 1600;
 
         for (let i = 0; i < output.length; i++) {
-            let inputVal = inputL[i];
-            
-            // --- 1. RATE CALCULATION (CALIBRATED) ---
-            
-            let speedCtrl = this.params.knobRate + (cvIn[i] * 0.5);
+            // --- 1. Rise/fall rate control ---
+           
+            let speedCtrl = this.params.knobRate + (cvIn[i] * 0.5)
+                            - this.params.isExponential*this.currentVoltage*EXP_AMT;
+				
             speedCtrl = Math.max(0.0, Math.min(1.0, speedCtrl));
-            
-            // CALIBRATION:
-            speedCtrl = Math.pow(speedCtrl, 2.8);
 
-            const MAX_COEFF = 0.038;       
-            const MIN_COEFF = 0.0000001;   
-            
-            const ratio = MIN_COEFF / MAX_COEFF;
-            let rate = MAX_COEFF * Math.pow(ratio, speedCtrl);
+            let rate = MAX_COEFF * Math.exp(-4*speedCtrl*(2+speedCtrl));
+            let riseCoeff = (this.params.shape === 0)?INSTANT:rate;
+            let fallCoeff = (this.params.shape === 2)?INSTANT:rate;
 
-            // --- 2. SHAPE MODES (Switch Logic) ---
-            const INSTANT = 1.0;
-            
-            let riseCoeff = rate;
-            let fallCoeff = rate;
+            // --- 2. Target logic  ---
+            let target = inputL[i]; // target is input, by default
 
-            if (this.params.shape === 0) riseCoeff = INSTANT;
-            if (this.params.shape === 2) fallCoeff = INSTANT;
+            if (this.params.mode === 0 && this.loopOffset) 
+                target += LOOP_OFFSET;
+            else if (this.params.mode === 2)
+                target += BLIP_OFFSET;
 
-            // --- 3. TARGET LOGIC ---
-            let target = inputVal;
-            
-            if (this.params.mode === 0) { // LOOP MODE
-                const ceiling = Math.min(RAIL_MAX, inputVal + LOOP_OFFSET);
-                const floor = inputVal;
-                
-                if (this.isRising) {
-                    target = ceiling + 0.05; 
-                    if (this.currentVoltage >= ceiling) this.isRising = false;
-                } else {
-                    target = floor - 0.05; 
-                    if (this.currentVoltage <= floor) this.isRising = true;
-                }
-            } 
-            else if (this.params.mode === 2) { // GATE MODE
-                target = Math.min(RAIL_MAX, inputVal + LOOP_OFFSET);
-            }
+            // --- 4. Travel towards target ---
 
-            // --- 4. PHYSICS ---
             const delta = target - this.currentVoltage;
-            const isGrowing = delta > 0;
-            const activeCoeff = isGrowing ? riseCoeff : fallCoeff;
+            const incr = (delta>0) ? riseCoeff : -fallCoeff;
+            this.currentVoltage = Math.min(this.currentVoltage + incr, RAIL_MAX);
 
-            if (this.params.isExponential) {
-                if (isGrowing) {
-                    // --- FIX: EXPONENTIAL ATTACK (Concave Up) ---
-                    // "Start Slow, Get Faster"
-                    // Math: Step size increases as Voltage increases. 
-                    // (0.1 bias prevents stalling at zero).
-                    
-                    const growth = (this.currentVoltage + 0.1) * (activeCoeff*1.2)*.2;
-                    this.currentVoltage += growth;
-                    
-                    if (this.currentVoltage > target) this.currentVoltage = target;
-                } 
-                else {
-                    // --- EXPONENTIAL DECAY (Convex Down) ---
-                    // "Start Fast, Get Slower"
-                    // Standard RC behavior.
-                    
-                    this.currentVoltage += delta * activeCoeff/1.3/2.5;
-                }
-
-            } else {
-                // LINEAR MODE
-                const linearStep = activeCoeff * 0.1; 
-                
-                if (Math.abs(delta) <= linearStep) {
-                    this.currentVoltage = target;
-                } else {
-                    this.currentVoltage += Math.sign(delta) * linearStep;
-                }
-            }
+            // --- 5. Behaviour upon hitting target  ---
+			if (delta*(target-this.currentVoltage)<0) // if we went past the target
+			{					
+				this.currentVoltage = target; // clamp output to target
+				if (this.params.mode === 0) // if looping, toggle flip-flop of target position
+					this.loopOffset = !this.loopOffset;
+			}
 
             output[i] = this.currentVoltage;
 
-            // --- LED ACCUMULATION ---
-            let dir = 0;
-            if (this.params.mode === 0) {
-                dir = this.isRising ? 1 : -1;
-            } else {
-                const diff = this.currentVoltage - this.lastV;
-                if (diff > 1e-9) dir = 1;
-                else if (diff < -1e-9) dir = -1;
-            }
-            this.lastV = this.currentVoltage;
-
-            if (dir === 1) this.riseSamples++;
-            if (dir === -1) this.fallSamples++;
+            // --- 6. LED accumulation ---
+            let dir = Math.tanh(delta*-30);
+            if (dir > 0) this.riseSamples += dir;
+            else this.fallSamples -= dir;
         }
 
         // --- SEND LED UPDATE ---
         this.totalSamples += 128;
         if (this.totalSamples >= LED_UPDATE_RATE) {
-            const rVal = this.riseSamples / this.totalSamples;
-            const fVal = this.fallSamples / this.totalSamples;
+            // Quite aggressive gamma correction on LEDs
+            const rVal = Math.pow(this.riseSamples / this.totalSamples, 0.25);
+            const fVal = Math.pow(this.fallSamples / this.totalSamples, 0.25);
             this.port.postMessage({ rise: rVal, fall: fVal });
             this.riseSamples = 0; this.fallSamples = 0; this.totalSamples = 0;
         }
