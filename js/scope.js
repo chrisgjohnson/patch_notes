@@ -362,32 +362,31 @@ function drawScope() {
 
         // --- Measurements (Vpp & Hz) ---
         if (!scopeFrozen && audioCtx) {
-            // 1. Calculate Vpp
+            // 1. Calculate Vpp (Peak-to-Peak)
             let min = 1.0, max = -1.0;
             const len = scopeData1.length;
             
-            // Step by 4 to save CPU, but scan the buffer
+            // Scan buffer to find min/max
             for (let i = 0; i < len; i += 4) {
                 const v = scopeData1[i];
                 if (v < min) min = v;
                 if (v > max) max = v;
             }
             
-            // Raw Vpp (0.0 to 2.0)
             const rawVpp = max - min;
             
-            // Scale to System Voltage (1.0 = 12V)
-            const vpp = rawVpp * 12.0;
-
+            // Display Vpp (Scaled to +/- 12V system)
+            const scaledVpp = rawVpp * 12.0;
             const elVpp = document.getElementById('measVpp');
-            if (elVpp) elVpp.textContent = `Vpp:${vpp.toFixed(2)}V`;
+            if (elVpp) elVpp.textContent = `Vpp:${scaledVpp.toFixed(2)}V`;
 
-            // 2. Frequency (Schmitt Trigger)
+            // 2. Calculate Frequency (Schmitt Trigger)
             const elFreq = document.getElementById('measFreq');
             if (elFreq) {
-                if (vpp > 0.1) {
-                    const highThresh = max - (vpp * 0.2); // Top 80%
-                    const lowThresh = min + (vpp * 0.2);  // Bottom 20%
+                // Only calculate if signal is strong enough (> 0.5V scaled)
+                if (rawVpp > 0.04) {
+                    const highThresh = max - (rawVpp * 0.3); // Top 70%
+                    const lowThresh = min + (rawVpp * 0.3);  // Bottom 30%
 
                     let state = -1; // -1: Init, 0: Low, 1: High
                     let periodCount = 0;
@@ -398,15 +397,13 @@ function drawScope() {
                         const val = scopeData1[i];
 
                         if (state === 1) {
-                            // Currently High, looking for Low
-                            if (val < lowThresh) {
-                                state = 0;
-                            }
+                            // Currently High, look for Low
+                            if (val < lowThresh) state = 0;
                         } else {
-                            // Currently Low (or Init), looking for High
+                            // Currently Low (or Init), look for High
                             if (val > highThresh) {
                                 if (state !== -1) {
-                                    // Found a rising edge cycle
+                                    // Found a cycle start
                                     if (firstCrossingIndex === -1) firstCrossingIndex = i;
                                     lastCrossingIndex = i;
                                     periodCount++;
@@ -421,8 +418,8 @@ function drawScope() {
                         const avgSamples = totalSamples / periodCount;
                         const hz = audioCtx.sampleRate / avgSamples;
 
-                        // Filter out crazy values
-                        if (hz > 5 && hz < 22000) {
+                        // Display if valid (Note: Buffer size limits low freq detection to ~6Hz)
+                        if (hz > 5 && hz < 24000) {
                             elFreq.textContent = `Hz:${Math.round(hz)}`;
                         } else {
                             elFreq.textContent = `Hz:--`;
@@ -435,7 +432,6 @@ function drawScope() {
                 }
             }
         }
-
         if (isRollingMode) {
             const now = performance.now();
             if (!window.lastScopeDrawTime) window.lastScopeDrawTime = now;

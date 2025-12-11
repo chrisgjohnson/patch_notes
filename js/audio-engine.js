@@ -635,7 +635,7 @@ function createVCO(type = 'sawtooth') {
     osc.type = type;
     osc.start();
     
-    // Output Buffer & Level Scaling ---
+    // --- FIX: Output Buffer & Level Scaling ---
     const output = audioCtx.createGain();
     
     // Scale amplitudes (Reference: +/- 12V system)
@@ -650,7 +650,8 @@ function createVCO(type = 'sawtooth') {
     osc.connect(output);
     
     const fmGain = audioCtx.createGain();
-    fmGain.connect(osc.frequency);
+    // Connect to detune for Exponential FM (exp(0.71*V))
+    fmGain.connect(osc.detune); 
 
     const pitchSum = audioCtx.createGain();
     pitchSum.gain.value = 6000;
@@ -1395,40 +1396,57 @@ function updateAudioParams() {
     // Oscillators
     const getOscFreq = (knobId) => {
         const kVal = componentStates[knobId] ? parseFloat(componentStates[knobId].value) : 0;
-        const center = 130.0; 
-
-        if (Math.abs(kVal) < 0.1) return center;
-
-        if (kVal > 0) {
-            return center * Math.pow(3000 / center, kVal / 90);
+        const center = 130.81; // C3 at 12 o'clock
+        
+        // Split Curve Logic:
+        // Ensures we hit exactly 0.5Hz at Min and 26.5kHz at Max
+        
+        if (kVal >= 0) {
+            // Upper Half (0 to +150): 130.81Hz -> 26500Hz
+            return center * Math.pow(26500 / center, kVal / 150);
         } else {
-            const targetLow = 70 / 60;
-            return center * Math.pow(targetLow / center, Math.abs(kVal) / 150);
+            // Lower Half (0 to -150): 130.81Hz -> 0.5Hz
+            return center * Math.pow(0.5 / center, Math.abs(kVal) / 150);
         }
     };
 
+    // Fine Tune: 1.38 ratio range
+    // Total Range = 1200 * log2(1.38) ~= 558 cents
+    // Knob (+/- 150) maps to +/- 279 cents
+    const getFineTune = (knobId) => {
+        const kVal = componentStates[knobId] ? parseFloat(componentStates[knobId].value) : 0;
+        const totalCents = 1200 * Math.log2(1.38); 
+        return (kVal / 150) * (totalCents / 2);
+    };
+
+    // --- OSC 1 ---
     const osc1Freq = getOscFreq('knob-large-osc1');
-    const kFine1 = componentStates['knob-small-osc1fine'] ? parseFloat(componentStates['knob-small-osc1fine'].value) : 0;
-    const fine1 = (kFine1 / 150.0) * 100;
+    const fine1 = getFineTune('knob-small-osc1fine');
 
     safeParam(audioNodes['VCO1'].osc.frequency, osc1Freq, now);
     safeParam(audioNodes['VCO1'].osc.detune, fine1, now);
     safeParam(audioNodes['VCO1_Sin'].osc.frequency, osc1Freq, now);
     safeParam(audioNodes['VCO1_Sin'].osc.detune, fine1, now);
-    const fm1 = getKnobValue('knob-small-osc1fm', 0, 3000, 'exp');
-    safeParam(audioNodes['VCO1'].fmGain.gain, fm1, now); safeParam(audioNodes['VCO1_Sin'].fmGain.gain, fm1, now);
+    
+    // FM: Max 14750 cents (approx 12.3 octaves at 12V input)
+    // Using exponential knob curve for smoother control at low levels
+    const fm1 = getKnobValue('knob-small-osc1fm', 0, 14750, 'exp');
+    safeParam(audioNodes['VCO1'].fmGain.gain, fm1, now); 
+    safeParam(audioNodes['VCO1_Sin'].fmGain.gain, fm1, now);
 
+    // --- OSC 2 ---
     const osc2Freq = getOscFreq('knob-large-osc2');
-    const kFine2 = componentStates['knob-small-osc2fine'] ? parseFloat(componentStates['knob-small-osc2fine'].value) : 0;
-    const fine2 = (kFine2 / 150.0) * 100;
+    const fine2 = getFineTune('knob-small-osc2fine');
 
     safeParam(audioNodes['VCO2'].osc.frequency, osc2Freq, now);
     safeParam(audioNodes['VCO2'].osc.detune, fine2, now);
     safeParam(audioNodes['VCO2_Sin'].osc.frequency, osc2Freq, now);
     safeParam(audioNodes['VCO2_Sin'].osc.detune, fine2, now);
-    const fm2 = getKnobValue('knob-small-osc2fm', 0, 3000, 'exp');
-    safeParam(audioNodes['VCO2'].fmGain.gain, fm2, now); safeParam(audioNodes['VCO2_Sin'].fmGain.gain, fm2, now);
-
+    
+    const fm2 = getKnobValue('knob-small-osc2fm', 0, 14750, 'exp');
+    safeParam(audioNodes['VCO2'].fmGain.gain, fm2, now); 
+    safeParam(audioNodes['VCO2_Sin'].fmGain.gain, fm2, now);
+    
     // Filters
     const getRes = (kId) => {
         const raw = getKnobValue(kId, 0, 1, 'linear');
